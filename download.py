@@ -26,6 +26,10 @@ import re
 import shutil
 import sys
 import urllib
+import datetime
+import string
+import zipfile
+import subprocess
 
 BASE_URL = "https://sso.garmin.com/sso/login"
 GAUTH = "https://connect.garmin.com/modern/auth/hostname"
@@ -36,6 +40,7 @@ ACTIVITIES = "https://connect.garmin.com/modern/proxy/activitylist-service/activ
 WELLNESS = "https://connect.garmin.com/modern/proxy/userstats-service/wellness/daily/%s?fromDate=%s&untilDate=%s"
 DAILYSUMMARY = "https://connect.garmin.com/modern/proxy/wellness-service/wellness/dailySummaryChart/%s?date=%s"
 
+ORIGINAL = "https://connect.garmin.com/modern/proxy/download-service/files/activity/%s"
 TCX = "https://connect.garmin.com/modern/proxy/download-service/export/tcx/activity/%s"
 GPX = "https://connect.garmin.com/modern/proxy/download-service/export/gpx/activity/%s"
 
@@ -50,7 +55,7 @@ def login(agent, username, password):
     agent.set_handle_robots(False)   # no robots
     agent.set_handle_refresh(False)  # can sometimes hang without this
     agent.open(script_url)
-    agent.addheaders = [('User-agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/535.2 (KHTML, like Gecko) Chrome/15.0.874.121 Safari/535.2')]
+    agent.addheaders = [('User-agent', 'Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.181 Safari/537.36')]
     hostname_url = agent.open(GAUTH)
     hostname = json.loads(hostname_url.get_data())['host']
 
@@ -111,6 +116,18 @@ def file_exists_in_folder(filename, folder):
             return True
     return False
 
+def garmin_encode_file_name(dt):
+    table = string.digits + string.ascii_uppercase
+    epoch = datetime.datetime(year=1989, month=12, day=31)  # timezone omitted
+
+    name = str(dt.year - 2010)
+    name += table[dt.month]
+    name += table[dt.day]
+    name += table[dt.hour]
+    name += str(int((dt - epoch).total_seconds()))[-4:]
+
+    return name
+
 def activities(agent, outdir, increment = 100):
     global ACTIVITIES
     currentIndex = 0
@@ -131,19 +148,69 @@ def activities(agent, outdir, increment = 100):
             # Read this list of activities and save the files.
 
             activityId = item['activityId']
-            activityDate = item['startTimeLocal'][:10]
-            url = TCX % activityId
-            file_name = '{}_{}.txt'.format(activityDate, activityId)
+            activityDate = item['startTimeLocal'][:10] # startTimeLocal: "YYYY-MM-DD hh:mm:ss"
+            url = ORIGINAL % activityId
+            file_name = '{}_{}.zip'.format(activityDate, activityId)
             if file_exists_in_folder(file_name, output):
                 print('{} already exists in {}. Skipping.'.format(file_name, output))
                 continue
             print('{} is downloading...'.format(file_name))
             datafile = agent.open(url).get_data()
             file_path = os.path.join(outdir, file_name)
-            f = open(file_path, "w")
+            f = open(file_path, "wb")
             f.write(datafile)
             f.close()
-            shutil.copy(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), file_name))
+            #shutil.copy(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), file_name))
+
+            z = zipfile.ZipFile(file_path, 'r')
+            if len(z.infolist()) != 1:
+                raise ValueError('zip file expected to contain a single entry: ' + file_path)
+            zinfo = z.infolist()[0]
+            z.extract(zinfo, os.path.dirname(file_path))
+            z.close()
+            del z
+            os.remove(file_path)
+
+            if len(item['startTimeLocal']) != 19:
+                raise ValueError('unsupported activity date: ' + item['startTimeLocal'])
+            activityDateTime = datetime.datetime(
+                year=int(item['startTimeLocal'][0:4]),
+                month=int(item['startTimeLocal'][5:7]),
+                day=int(item['startTimeLocal'][8:10]),
+                hour=int(item['startTimeLocal'][11:13]),
+                minute=int(item['startTimeLocal'][14:16]),
+                second=int(item['startTimeLocal'][17:19]))
+            garmin_encoded_fit_name = unicode(garmin_encode_file_name(activityDateTime))
+            final_file_name = '{:04}{:02}{:02}_{:02}{:02}{:02}_{}_{}{}'.format(
+                activityDateTime.year,
+                activityDateTime.month,
+                activityDateTime.day,
+                activityDateTime.hour,
+                activityDateTime.minute,
+                activityDateTime.second,
+                garmin_encoded_fit_name,
+                activityId,
+                os.path.splitext(zinfo.filename)[1].upper())
+            final_file = os.path.join(os.path.dirname(file_path), final_file_name)
+
+            shutil.move(
+                os.path.join(os.path.dirname(file_path), zinfo.filename),
+                final_file)
+
+            # change file times to activity date
+            nircmd_date = '{:02}-{:02}-{:04} {:02}:{:02}:{:02}'.format(
+                activityDateTime.day,
+                activityDateTime.month,
+                activityDateTime.year,
+                activityDateTime.hour,
+                activityDateTime.minute,
+                activityDateTime.second)
+            subprocess.call(
+                [r'D:\prog\apps\nircmd64\nircmdc.exe',
+                    'setfiletime',
+                    final_file,
+                    nircmd_date, nircmd_date, nircmd_date],
+                env={}, shell=False)
 
         # We still have at least 1 activity.
         currentIndex += increment
@@ -226,10 +293,10 @@ if __name__ == "__main__":
         help = 'CSV file with username and password in "username,password" format.',
         default = None)
     parser.add_argument('-s', '--startdate', required = False,
-        help = 'Start date for wellness data',
+        help = 'Start date for wellness data (YYYY-MM-DD)',
         default = None)
     parser.add_argument('-e', '--enddate', required = False,
-        help = 'End date for wellness data',
+        help = 'End date for wellness data (YYYY-MM-DD)',
         default = None)
     parser.add_argument('-d', '--displayname', required = False,
         help = 'Displayname (see the url when logged into Garmin Connect)',
